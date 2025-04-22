@@ -1,0 +1,245 @@
+def backtrader_general(data, strategy, param, conditions, output):
+    """
+    通用Backtrader回测框架函数
+
+    Parameters:
+    ----------
+    data : pd.DataFrame
+        标准的行情数据，index 为 时间， 包含时间索引以及 OHLCV 字段。
+    strategy : function
+        开仓和平仓逻辑函数，在外部定义并传入。
+    param : dict
+        关于策略的一系列参数，例如指标窗口期、阈值等。
+    conditions : dict
+        关于回测的参数，例如滑点、手续费、杠杆倍数等。
+    output : dict
+        输出内容的配置选项，例如是否生成 pyfolio 分析报告，是否输出交易明细等。
+
+    Returns:
+    -------
+    results : dict
+        回测结果，包含账户净值、指标分析、交易明细等。
+    """
+    import backtrader as bt
+    import pandas as pd
+
+    # 1. 数据检查和预处理
+    print("Step 1: 数据检查与预处理")
+    if 'time' in data.columns:
+        data['time'] = pd.to_datetime(data['time'])
+        data.set_index('time', inplace=True)
+    elif 'datetime' in data.columns:
+        data['datetime'] = pd.to_datetime(data['datetime'])
+        data.set_index('datetime', inplace=True)
+    else:
+        raise ValueError("数据缺少时间列 ('time' 或 'datetime')，请检查输入数据格式。")
+
+    required_columns = ['open', 'high', 'low', 'close', 'volume']
+    missing_columns = [col for col in required_columns if col not in data.columns]
+    if missing_columns:
+        raise ValueError(f"数据缺少以下必要列: {missing_columns}")
+
+    data.sort_index(inplace=True)  # 确保数据按时间升序排列
+
+
+    # 2. 定义策略（开仓平仓条件）
+    # 2.1 引入 backtrader
+    # 策略
+    class MyStrategy(bt.Strategy):
+        # 定义参数，可通过初始化时传入具体值覆盖默认值
+        params = (
+            ('margin', None),  # 保证金比例，用于计算仓位大小
+            ('max_pos', None),  # 最大仓位比例，控制风险敞口
+            ('mult', None),  # 合约乘数，用于换算合约交易量
+            ('bollinger_period', None),  # 布林通道的周期
+            ('bollinger_dev', None),  # 布林通道的标准差倍数
+            ('dynamic_logic', None),  # 动态开平仓逻辑函数，由外部传入
+        )
+        """
+        BT框架1. 全局函数，定义需要使用的指标，需要记录的等
+        """
+        def __init__(self):
+            """
+            初始化函数，用于定义技术指标、记录变量和交易状态。
+            """
+
+            # 初始化交易记录 DataFrame
+            self.trade_records = pd.DataFrame(columns=[
+            'datetime', 'action', 'size', 'price', 'commission',
+            'profit', 'cash_balance', 'total_value'
+            ])
+            # 进度条相关（可选，用于调试或监控进度）
+            self.bar_count = 0  # 用于跟踪已处理的 bar 数目
+
+            # 用于存储每日聚合数据（如每日收盘价和收益率）
+            self.daily_returns = []  # 每日收益率列表
+            self.daily_closes = []  # 每日收盘价记录
+
+            # 交易记录变量
+            self.holding_highest_price = None  # 当前持仓的最高价格
+            self.holding_lowest_price = None  # 当前持仓的最低价格
+            self.entry_price = None  # 开仓价格
+            self.stop_loss_times = 0  # 统计止损次数
+            self.stop_earn_times = 0  # 统计止盈次数
+            self.total_trades = 0  # 总交易次数
+            self.holding_time = 0  # 当前持仓持续时间
+            self.has_long_position = False  # 是否有多头仓位
+            self.has_short_position = False  # 是否有空头仓位
+            self.total_executed_value = 0  # 累计成交金额
+            self.total_trade_size = 0  # 累计成交手数
+            self.total_commision = 0.0  # 累计手续费
+            self.minutes = 0  # 策略运行的时间计数器（分钟单位）
+            self.holding_long_time = 0  # 持有多头仓位的时间
+            self.holding_short_time = 0  # 持有空头仓位的时间
+
+            # 初始现金，用于计算收益率等指标
+            self.starting_cash = self.broker.getvalue()
+
+            # 技术指标
+            self.atr = bt.indicators.AverageTrueRange(self.data)  # 平均真实波幅（ATR），用于衡量市场波动性
+            self.bollinger = bt.indicators.BollingerBands(
+                self.data.close,
+                period=self.params.bollinger_period,  # 布林通道的周期参数
+                devfactor=self.params.bollinger_dev  # 布林通道的标准差倍数参数
+            )
+
+            # 交叉信号检测，记录价格与布林通道的交叉情况
+            self.cross_top = bt.indicators.CrossOver(self.data.close, self.bollinger.lines.top)  # 上轨交叉
+            self.cross_bottom = bt.indicators.CrossOver(self.data.close, self.bollinger.lines.bot)  # 下轨交叉
+            self.cross_mid = bt.indicators.CrossOver(self.data.close, self.bollinger.lines.mid)  # 中轨交叉
+        """
+        BT框架2. NEXT为每一个BAR需要做的操作，定义开平仓，按照BAR记录等
+        """
+        def next(self):
+            """
+            每个 bar 的处理逻辑，包括开平仓和记录数据。
+            """
+            # 更新时间计数器
+            self.minutes += 1
+
+            # 获取当前账户现金余额
+            cash = self.broker.get_cash()
+
+            # 根据账户现金和参数计算最大允许开仓的手数
+            max_size = int(cash * self.params.max_pos / self.datas[0].close[0] / self.params.margin / self.params.mult)
+
+            # 获取当前日期
+            current_date = self.datas[0].datetime.date(0)
+
+            # 检查是否是新的一天
+            if len(self.daily_closes) == 0 or self.daily_closes[-1]['date'] != current_date:
+                if len(self.daily_closes) > 0:
+                    # 计算昨日收盘价与今日收盘价的涨跌幅
+                    previous_close = self.daily_closes[-1]['close']
+                    daily_return = (self.data.close[0] - previous_close) / previous_close
+                    self.daily_returns.append(daily_return)
+                else:
+                    # 第一条记录没有前一天的收盘价，涨跌幅设为 0
+                    self.daily_returns.append(0)
+
+                # 记录今日的收盘价
+                self.daily_closes.append({
+                    'date': current_date,
+                    'close': self.data.close[0]
+                })
+
+            # ***************调用动态开平仓逻辑（外部传入函数），传递当前策略和最大手数
+            if self.params.dynamic_logic:
+                self.params.dynamic_logic(self, max_size)
+
+        """
+        BT框架3 . 记录函数，记录每次开仓，每笔平仓后的交易等
+        """
+        def notify_trade(self, trade):
+            """
+            处理交易事件，记录交易利润和相关信息。
+            """
+            if trade.isclosed:
+                self.total_trades += 1  # 更新总交易次数
+
+                # 找到最近一次平仓记录的索引
+                last_trade_index = self.trade_records[
+                    (self.trade_records['action'] == '多平') |
+                    (self.trade_records['action'] == '空平')
+                ].index[-1]
+
+                # 更新平仓记录的利润信息（含手续费）
+                self.trade_records.loc[last_trade_index, 'profit'] = trade.pnlcomm
+
+                # 重置开仓价格
+                self.entry_price = None
+
+            if trade.justopened:
+                # 记录开仓价格
+                self.entry_price = trade.price
+
+
+        def notify_order(self, order):
+            """
+            处理订单事件，记录订单完成后的详细信息。
+            """
+            if order.status in [order.Completed]:
+                # 判断交易类型
+                if order.isbuy():
+                    action = '多开' if not self.position else '多平'
+                elif order.issell():
+                    action = '空开' if not self.position else '空平'
+                else:
+                    action = '未知'
+
+                # 更新累计成交金额和手续费
+                traded_amount = order.executed.price * order.executed.size
+                self.total_executed_value += abs(traded_amount)
+                self.total_trade_size += abs(order.executed.size)
+                self.total_commision += order.executed.comm
+
+                # 记录订单完成后的信息到交易记录 DataFrame
+                self.trade_records = pd.concat([
+                    self.trade_records,
+                    pd.DataFrame([{
+                        'datetime': self.datas[0].datetime.datetime(0),  # 当前时间
+                        'action': action,  # 多开、多平、空开、空平
+                        'size': abs(order.executed.size),  # 成交手数
+                        'price': order.executed.price,  # 成交价格
+                        'commission': order.executed.comm,  # 手续费
+                        'profit': None,  # 初始为 None，由 notify_trade 更新
+                        'cash_balance': self.broker.get_cash(),  # 当前现金余额
+                        'total_value': self.broker.getvalue()  # 当前账户总价值
+                    }])
+                ], ignore_index=True)
+
+        """
+        BT框架4  收尾工作
+        """
+
+        def stop(self):
+            # self.total_turnover_ratio = (self.broker.getvalue() + self.starting_cash) / 2 / self.total_executed_value
+            self.total_turnover_ratio = (self.total_executed_value / 2) / (
+                        (self.broker.getvalue() + self.starting_cash) / 2)
+            # self.final_value = self.broker.getvalue()
+                    # 转换为 DataFrame 以便进一步处理或保存
+            self.daily_returns_df = pd.DataFrame({
+                'date': [x['date'] for x in self.daily_closes],
+                'close': [x['close'] for x in self.daily_closes],
+                'return': self.daily_returns
+            })
+
+
+        """
+        BT框架5： 执行模块
+        """
+
+    cerebro = bt.Cerebro()
+    cerebro.broker.addcommissioninfo()  # 手续费
+    cerebro.broker.setcash(1000_0000)  # 初始资金
+    cerebro.addstrategy(MyStrategy,  dynamic_logic=open_close_logic)  # 加入策略
+
+    # 加入数据
+    data_feed = bt.feeds.PandasData(dataname=data)
+    cerebro.adddata(data_feed)
+
+
+
+
+
+    # 回测
