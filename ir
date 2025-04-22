@@ -1,0 +1,82 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from statsmodels.tsa.api import VAR
+from statsmodels.tsa.stattools import adfuller
+
+class ChinaInterestRateTransmission:
+    def __init__(self, data: pd.DataFrame):
+        """
+        初始化传导模型分析类
+
+        参数：
+        - data: pd.DataFrame，列为不同利率变量，索引为时间（datetime 格式）
+        """
+        self.raw_data = data
+        self.model = None
+        self.results = None
+        self.diff_data = None
+        self.selected_lag = None
+
+    def check_stationarity(self, verbose=True):
+        """
+        检查每个变量的平稳性（ADF 检验）
+        """
+        results = {}
+        for col in self.raw_data.columns:
+            adf_result = adfuller(self.raw_data[col].dropna())
+            results[col] = {
+                'ADF Statistic': adf_result[0],
+                'p-value': adf_result[1]
+            }
+            if verbose:
+                print(f"{col} - ADF: {adf_result[0]:.4f}, p-value: {adf_result[1]:.4f}")
+        return results
+
+    def difference_data(self):
+        """
+        对数据进行一阶差分处理
+        """
+        self.diff_data = self.raw_data.diff().dropna()
+
+    def fit_var(self, maxlags=6, ic='aic'):
+        """
+        拟合 VAR 模型
+
+        参数：
+        - maxlags: 最大滞后阶数
+        - ic: 信息准则，可选 'aic', 'bic', 'fpe', 'hqic'
+        """
+        if self.diff_data is None:
+            self.difference_data()
+
+        model = VAR(self.diff_data)
+        self.selected_lag = model.select_order(maxlags=maxlags).__dict__[ic]
+        self.model = model
+        self.results = model.fit(self.selected_lag)
+        print(f"VAR 模型拟合完成，滞后阶数为：{self.selected_lag}")
+
+    def plot_irf(self, impulse: str, response: str, steps: int = 10):
+        """
+        绘制脉冲响应函数图
+
+        参数：
+        - impulse: 冲击变量
+        - response: 响应变量
+        - steps: 脉冲响应期数
+        """
+        if self.results is None:
+            raise ValueError("请先调用 fit_var() 方法拟合模型。")
+
+        irf = self.results.irf(steps)
+        irf.plot(orth=False, impulse=impulse, response=response)
+        plt.title(f"IRF: {impulse} → {response}")
+        plt.show()
+
+    def summary(self):
+        """
+        输出模型摘要
+        """
+        if self.results:
+            print(self.results.summary())
+        else:
+            print("模型尚未拟合，请先调用 fit_var()。")
