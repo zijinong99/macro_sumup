@@ -1,0 +1,438 @@
+
+class VIXlive:
+
+
+    def __init__(self,):
+
+        # 获取今天的日期
+        self.target_time = datetime.datetime.now()
+        self.target_date = self.target_time.date()
+        self.target_date = pd.Timestamp(self.target_date)
+
+
+        self.dfoc = pd.DataFrame()
+        # 定义要执行的方法列表
+        methods = [
+
+            self.load_data, # 期权数据计算
+            self.select_month, # 选择到期月份
+            self.get_contract_codes, # 选择选定月份的合约代码
+            self.get_all_price_live, # 一次性获得所有价格
+            self.create_option_price_df, # 合约价格填充
+            self.get_300etf_price, # S0
+            self.calculate_risk_free_rate, # 无风险利率
+            self.calculate_forward_price, # 理论远期价格
+            self.calculate_contribution, # vix_contri
+            self.calculate_vix, # 计算vix
+            self.calculate_pcr,
+
+        ]
+
+        # 遍历方法并尝试执行它们
+        for method in methods:
+            try:
+                method()
+            except Exception as e:
+                print(f"Error in {method.__name__}: {e}")
+
+    def load_data(self):
+
+        # 当天所有期权的代码：
+        self.dfoc = pd.read_csv(r'C:\Users\Zijin\Desktop\PYs\稳定版\oc.csv' , encoding='gbk')
+
+        self.dfoc['strike_date'] = pd.to_datetime(self.dfoc['strike_date'])
+        self.dfoc['list_date'] = pd.to_datetime(self.dfoc['list_date'])
+
+        # self.dfoc = self.dfoc[self.dfoc['unit']==10000]
+
+        return self.dfoc
+
+
+    def get_300etf_price(self):
+        # 获取当前的收盘价格
+        df = THS_RQ('510300.SH', 'latest;amount')
+        df = pd.DataFrame(df.data)
+        hs300 = df['latest'][0]
+        self.s0 = hs300
+        return self.s0
+
+    def select_month(self):
+
+        # 在oc
+        current_date = self.target_date.normalize()
+        same_month_contracts = self.dfoc[(self.dfoc['strike_date'].dt.month == current_date.month) &
+                                        (self.dfoc['strike_date'].dt.year == current_date.year)]
+
+        if not same_month_contracts.empty:
+            expire_date = same_month_contracts['strike_date'].min()
+        else:
+            expire_date = None
+
+
+        # 如果到期日与当前日期的差大于等于5天，则选择当前月份
+        if expire_date and (expire_date - current_date).days >= 5:
+            self.contract_month1 = "{}-{}".format(current_date.year, current_date.month)
+        else:
+            self.contract_month1 = (current_date + pd.offsets.MonthBegin(1)).strftime('%Y-%m')
+
+        # print('到期日',expire_date,'今天对的日期', current_date,'所选择的月份', self.contract_month1)
+
+        # 为第二个月份计算合约
+        # 第二个月份的合约可能需要迭代找到
+        contract_month2_date = pd.to_datetime(self.contract_month1) + pd.offsets.MonthBegin(1)
+
+        # print(contract_month2_date)
+        # print('理论下月合约：' ,contract_month2_date.year, contract_month2_date.month)
+
+        while True:
+            # 选择第二个月份到期的合约
+            next_month_contracts = self.dfoc[
+                (self.dfoc['strike_date'].dt.month == contract_month2_date.month) &
+                (self.dfoc['strike_date'].dt.year == contract_month2_date.year)
+            ]
+
+            if not next_month_contracts.empty:
+                # 检查合约的上市日期是否小于当前日期
+                if next_month_contracts['list_date'].iloc[0] <= current_date:
+                    break  # 找到有效的第二个月份，退出循环
+                else:
+                    contract_month2_date += pd.offsets.MonthBegin(1)  # 没有找到则推到下一个月
+            else:
+                contract_month2_date += pd.offsets.MonthBegin(1)  # 如果DataFrame是空的，也推到下一个月
+
+            # 可选：添加一个防止无限循环的安全措施
+            if contract_month2_date.year > 2026:
+                break
+
+        # print(contract_month2_date)
+        # 设置第二个合约月份
+        self.contract_month2 = contract_month2_date.strftime('%Y-%m')
+
+        # 找到MONTH2之后date
+        self.after_month2_contracts = self.dfoc[self.dfoc['strike_date'] > (contract_month2_date+ pd.offsets.MonthBegin(1))]
+
+
+        # 计算T1和T2
+        self.T1 = self.calculate_T(self.contract_month1)
+        self.T2 = self.calculate_T(self.contract_month2)
+
+        self.expire_date = expire_date
+
+        return self.contract_month1, self.contract_month2, self.T1, self.T2, self.expire_date
+
+
+    def calculate_T(self, contract_month):
+        contract_date = pd.to_datetime(contract_month)
+
+        # 找到到期月份的到期日期
+        expiration_date = self.dfoc[
+            (self.dfoc['strike_date'].dt.month == contract_date.month) &
+            (self.dfoc['strike_date'].dt.year == contract_date.year)
+        ]['strike_date'].min()
+
+        # 计算当前日期到到期日期的天数
+        days_to_expiration = (expiration_date - self.target_date).days
+
+        # 计算T
+        T = days_to_expiration / 365
+        return T
+
+    def get_contract_codes(self):
+        """
+        Get the contract codes of the options that expire in the given month.
+        Parameters:
+        - contract_month: a string representing the month in the format YYYY-MM
+        Returns:
+        - A list of contract codes
+        """
+        # 将字符串转换为日期对象
+
+        contract_date1 = pd.to_datetime(self.contract_month1)
+        # 选择给定月份到期的合约
+        selected_contracts1 = self.dfoc[
+            (self.dfoc['strike_date'].dt.month == contract_date1.month) &
+            (self.dfoc['strike_date'].dt.year == contract_date1.year)
+        ]
+
+        # 获取并返回合约代码
+        self.contract_codes1 = selected_contracts1
+
+        contract_date2 = pd.to_datetime(self.contract_month2)
+        # 选择给定月份到期的合约
+        selected_contracts2 = self.dfoc[
+            (self.dfoc['strike_date'].dt.month == contract_date2.month) &
+            (self.dfoc['strike_date'].dt.year == contract_date2.year)
+        ]
+
+        # 获取并返回合约代码
+        self.contract_codes2 = selected_contracts2
+
+        return self.contract_codes1, self.contract_codes2
+
+
+    def get_all_price_live(self):
+
+
+        code1 = self.contract_codes1['trading_code'].tolist()
+        code2 = self.contract_codes2['trading_code'].tolist()
+
+        price1 =  THS_RQ(code1,'latest;volume;openInterest')
+        price1 = pd.DataFrame(price1.data)
+        self.price1 = pd.merge(self.contract_codes1, price1, left_on='trading_code', right_on='thscode', )
+
+        price2 =  THS_RQ(code2,'latest;volume;openInterest')
+        price2 = pd.DataFrame(price2.data)
+        self.price2 = pd.merge(self.contract_codes2, price2, left_on='trading_code', right_on='thscode', )
+
+        code3 = self.after_month2_contracts['trading_code'].tolist()
+        price3 =  THS_RQ(code3,'latest;volume;openInterest')
+        price3 = pd.DataFrame(price3.data)
+        self.price3 = pd.merge(self.dfoc, price3, left_on='trading_code', right_on='thscode', )
+
+    def create_option_price_df(self):
+        columns = ['Strike', 'Call', 'Put', 'Diff']
+        df_month1 = pd.DataFrame(columns=columns)
+        df_month2 = pd.DataFrame(columns=columns)
+
+        # Process data for month 1
+        for _, row in self.price1.iterrows():
+            strike = float(row['strike_price'])
+            option_type = 'Call' if '购' in row['name'] else 'Put'
+            price = float(row['latest'])
+
+            # Update df_month1
+            row_index = df_month1.index[df_month1['Strike'] == strike].tolist()
+            if row_index:
+                df_month1.at[row_index[0], option_type] = price
+            else:
+                df_month1 = df_month1.append({'Strike': strike, option_type: price}, ignore_index=True)
+
+        # Process data for month 2
+        for _, row in self.price2.iterrows():
+            strike = float(row['strike_price'])
+            option_type = 'Call' if '购' in row['name'] else 'Put'
+            price = float(row['latest'])
+
+            # Update df_month2
+            row_index = df_month2.index[df_month2['Strike'] == strike].tolist()
+            if row_index:
+                df_month2.at[row_index[0], option_type] = price
+            else:
+                df_month2 = df_month2.append({'Strike': strike, option_type: price}, ignore_index=True)
+
+        # Calculate 'Diff' for both months
+        df_month1['Call'] = df_month1['Call'].astype(float)
+        df_month1['Put'] = df_month1['Put'].astype(float)
+        df_month1['Diff'] = abs(df_month1['Call'] - df_month1['Put'])
+
+        df_month2['Call'] = df_month2['Call'].astype(float)
+        df_month2['Put'] = df_month2['Put'].astype(float)
+        df_month2['Diff'] = abs(df_month2['Call'] - df_month2['Put'])
+
+        # Sort by 'Strike'
+        df_month1.sort_values(by='Strike', inplace=True)
+        df_month2.sort_values(by='Strike', inplace=True)
+
+        # Drop rows with NaN values
+        df_month1.dropna(how='any', inplace=True)
+        df_month2.dropna(how='any', inplace=True)
+
+        # Find the strike price with the minimum 'Diff'
+        self.min_diff_month1 = df_month1.loc[df_month1['Diff'].idxmin(), 'Strike']
+        self.min_diff_month2 = df_month2.loc[df_month2['Diff'].idxmin(), 'Strike']
+
+        # Set attributes
+        self.df_month1 = df_month1.reset_index(drop=True)
+        self.df_month2 = df_month2.reset_index(drop=True)
+
+        return self.df_month1, self.df_month2, self.min_diff_month1, self.min_diff_month2
+
+    def calculate_risk_free_rate(self):
+
+
+        c1 = self.df_month1[self.df_month1['Strike'] == self.min_diff_month1]['Call'].iloc[0]
+        p1 = self.df_month1[self.df_month1['Strike'] == self.min_diff_month1]['Put'].iloc[0]
+
+        self.r1 = 0.02
+        self.r2 = self.r1
+
+        c2 = self.df_month2[self.df_month2['Strike'] == self.min_diff_month2]['Call'].iloc[0]
+        p2 = self.df_month2[self.df_month2['Strike'] == self.min_diff_month2]['Put'].iloc[0]
+        self.c1 = c1
+        self.c2 = c2
+        self.p1 = p1
+        self.p2 = p2
+
+        # self.r1 = (1/self.T1) * (math.log(self.min_diff_month1/(self.s0+p1-c1)))
+        # self.r2 =  (1/self.T2) * (math.log(self.min_diff_month2/(self.s0+p2-c2)))
+
+        return self.r1, self.r2, self.c1, self.c2, self.p1, self.p2
+
+
+        # 获取价差最低的期权行权价和DataFrame
+
+
+    def calculate_forward_price(self):
+
+        self.f1 = self.min_diff_month1 + math.exp(self.r1* self.T1) * (self.c1 - self.p1)
+        self.f2 = self.min_diff_month2 + math.exp(self.r2* self.T2) * (self.c2 - self.p2)
+        # print('r2=', self.r2, 'T2=', self.T2, 'K2=', self.min_diff_month2, 'C2P2', self.c2, self.p2)
+
+        return self.f1, self.f2
+
+    def calculate_contribution(self):
+
+
+        # # month1
+        # self.k0_1 = self.df_month1.loc[self.df_month1['Strike'] < self.f1].iloc[-1]['Strike']
+
+        # 检查是否存在小于 self.f1 的行权价格
+        if not self.df_month1[self.df_month1['Strike'] < self.f1].empty:
+            self.k0_1 = self.df_month1.loc[self.df_month1['Strike'] < self.f1].iloc[-1]['Strike']
+        else:
+            # 如果没有行权价小于 self.f1，则选择最小的行权价
+            self.k0_1 = self.df_month1['Strike'].min()
+
+        def calculate_delta_k(strikes, index):
+            if index == 0:
+                return strikes[index+1] - strikes[index]
+            elif index == len(strikes) - 1:
+                return strikes[index] - strikes[index-1]
+            else:
+                return (strikes[index+1] - strikes[index-1]) / 2
+
+        self.df_contri1 = self.df_month1.copy()
+
+        self.df_contri1.reset_index(inplace=True, drop=True)
+        strikes = self.df_contri1['Strike'].values
+
+        for index, row in self.df_contri1.iterrows():
+
+            # if index >= len(strikes):
+            #     break
+            K = row['Strike']
+
+            # 计算 ΔK
+            delta_k = calculate_delta_k(strikes, index)
+
+            # 根据 K 选择合适的期权价格
+            if K < self.k0_1:
+                option_price_1 = row['Put']
+
+            elif K == self.k0_1:
+                option_price_1 = (row['Put'] + row['Call']) / 2
+
+            else:
+                option_price_1 = row['Call']
+
+
+            # 计算vix贡献度
+            self.df_contri1.at[index, 'Month1_Contribution'] = (delta_k / K**2 )* np.exp(self.r1 * self.T1) * option_price_1 if option_price_1 > 0.0002 else 0
+
+            # print('dk=',delta_k,'Strike=', K, self.r1 ,'T=', self.T1, 'Q=', option_price_1)
+
+            # 计算skew贡献度 option_price就是 delta q
+            self.df_contri1.at[index, 'Month1_skew_Contribution'] = 1 / K**2 *delta_k * option_price_1 if option_price_1 > 0.0002 else 0
+
+        # month2
+        # 检查是否存在小于 self.f1 的行权价格
+        if not self.df_month2[self.df_month2['Strike'] < self.f2].empty:
+            self.k0_2 = self.df_month2.loc[self.df_month2['Strike'] < self.f2].iloc[-1]['Strike']
+        else:
+            # 如果没有行权价小于 self.f1，则选择最小的行权价
+            self.k0_2 = self.df_month2['Strike'].min()
+
+        def calculate_delta_k(strikes, index):
+            if index == 0:
+                return strikes[index+1] - strikes[index]
+            elif index == len(strikes) - 1:
+                return strikes[index] - strikes[index-1]
+            else:
+                return (strikes[index+1] - strikes[index-1]) / 2
+
+        self.df_contri2 = self.df_month2.copy()
+        strikes = self.df_contri2['Strike'].values
+
+        self.df_contri2.reset_index(inplace=True, drop=True)
+
+
+        for index, row in self.df_contri2.iterrows():
+
+            # if index >= len(strikes):
+            #     break
+            K = row['Strike']
+
+            # 计算 ΔK
+            delta_k = calculate_delta_k(strikes, index)
+
+            # 根据 K 选择合适的期权价格
+            if K < self.k0_2:
+                option_price_2 = row['Put']
+
+            elif K == self.k0_2:
+                option_price_2 = (row['Put'] + row['Call']) / 2
+
+            else:
+                option_price_2 = row['Call']
+
+
+            # 计算vix贡献度
+            self.df_contri2.at[index, 'Month2_Contribution'] = (delta_k / K**2) * np.exp(self.r2* self.T2) * option_price_2 if option_price_2 > 0.0002 else 0
+
+            # print('dk=',delta_k,'Strike=', K, self.r2 ,'T=', self.T2, 'Q=', option_price_2)
+            #
+            # 计算skew贡献度 option_price就是 delta q
+            self.df_contri2.at[index, 'Month2_skew_Contribution'] = 1 / K**2 *delta_k * option_price_2 if option_price_2 > 0.0002 else 0
+
+
+
+        return self.df_contri1, self.k0_1, self.df_contri2, self.k0_2
+
+    def calculate_vix(self):
+
+        sum_contri_1 = self.df_contri1['Month1_Contribution'].sum()
+        sum_contri_2 = self.df_contri2['Month2_Contribution'].sum()
+
+
+        self.sigma_square_1 = 2 * sum_contri_1 / self.T1 - (self.f1 / self.k0_1 - 1)**2 / self.T1
+        self.sigma_square_2 = 2 * sum_contri_2 / self.T2 - (self.f2 / self.k0_2 - 1)**2 / self.T2
+
+        N = 365  # 或 252，根据你的具体情况
+        NT1 = self.T1 * N
+        NT2 = self.T2 * N
+
+        vix_square = (self.T1 * self.sigma_square_1 * ((NT2*1440 - 43200) / (NT2*1440 - NT1*1440)) +
+                  self.T2 * self.sigma_square_2 * ((43200 - NT1*1440) / (NT2*1440 - NT1*1440))) * (525600/43200)
+
+        self.vix = 100 * np.sqrt(vix_square)
+
+        return self.vix, self.sigma_square_1, self.sigma_square_2
+
+    def calculate_pcr(self):
+
+        # 成交量PCR
+        call_volume_sum_1 = self.price1.loc[self.price1['name'].str.contains('购'), 'volume'].sum()
+        call_volume_sum_2 = self.price2.loc[self.price2['name'].str.contains('购'), 'volume'].sum()
+        put_volume_sum_1 = self.price1.loc[self.price1['name'].str.contains('沽'), 'volume'].sum()
+        put_volume_sum_2 = self.price2.loc[self.price2['name'].str.contains('沽'), 'volume'].sum()
+
+        call_volume_sum_3 = self.price3.loc[self.price3['name'].str.contains('购'), 'volume'].sum()
+        put_volume_sum_3 = self.price3.loc[self.price3['name'].str.contains('沽'), 'volume'].sum()
+
+
+
+        self.volume_pcr = (put_volume_sum_1 + put_volume_sum_2+ put_volume_sum_3) / (call_volume_sum_1 + call_volume_sum_2+ call_volume_sum_3)
+
+
+        # 持仓量PCR
+        call_open_sum_1 = self.price1.loc[self.price1['name'].str.contains('购'), 'openInterest'].sum()
+        call_open_sum_2 = self.price2.loc[self.price2['name'].str.contains('购'), 'openInterest'].sum()
+        put_open_sum_1 = self.price1.loc[self.price1['name'].str.contains('沽'), 'openInterest'].sum()
+        put_open_sum_2 = self.price2.loc[self.price2['name'].str.contains('沽'), 'openInterest'].sum()
+        call_open_sum_3 = self.price3.loc[self.price3['name'].str.contains('购'), 'openInterest'].sum()
+        put_open_sum_3 = self.price3.loc[self.price3['name'].str.contains('沽'), 'openInterest'].sum()
+
+
+        self.open_pcr = (put_open_sum_2 + put_open_sum_1+put_open_sum_3) / (call_open_sum_1 + call_open_sum_2+ call_open_sum_3)
+
+
