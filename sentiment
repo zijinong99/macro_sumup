@@ -1,0 +1,133 @@
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+class MarketSentimentIndex:
+    """
+    市场情绪指数构建类
+    """
+
+    def __init__(self, data: pd.DataFrame, n_components: int = 1, scale: bool = True):
+        """
+        初始化市场情绪指数类
+
+        参数：
+        - data: pd.DataFrame，行为时间索引，列为市场情绪因子（如溢价率、收益差等）
+        - n_components: 主成分数量，默认取第1主成分作为情绪指数
+        - scale: 是否标准化数据
+        """
+        self.raw_data = data.copy()
+        self.data = data.copy()
+        self.scale = scale
+        self.n_components = n_components
+        self.pca_model = None
+        self.scaler = None
+        self.sentiment_index = None
+        self.explained_variance_ratio = None
+        self.pca_weights = None
+
+    def preprocess(self):
+        """
+        数据预处理：缺失值处理、标准化
+        """
+        self.data = self.data.dropna()
+        if self.scale:
+            self.scaler = StandardScaler()
+            self.data[:] = self.scaler.fit_transform(self.data)
+
+    def fit_pca(self):
+        """
+        拟合PCA模型并提取主成分
+        """
+        self.preprocess()
+        self.pca_model = PCA(n_components=self.n_components)
+        principal_components = self.pca_model.fit_transform(self.data)
+        self.sentiment_index = pd.Series(
+            principal_components[:, 0],
+            index=self.data.index,
+            name="SentimentIndex"
+        )
+        self.explained_variance_ratio = self.pca_model.explained_variance_ratio_
+        self.pca_weights = pd.Series(
+            self.pca_model.components_[0],
+            index=self.data.columns,
+            name="PCA Weights"
+        )
+
+    def get_index(self) -> pd.Series:
+        """
+        返回市场情绪指数
+        """
+        if self.sentiment_index is None:
+            self.fit_pca()
+        return self.sentiment_index
+
+    def plot_index(self, benchmark: pd.Series = None):
+        """
+        绘制情绪指数，可对比参考指数
+
+        参数：
+        - benchmark: 可选的参考情绪指数，用于比较（如某基金月报中的指数）
+        """
+        if self.sentiment_index is None:
+            self.fit_pca()
+
+        plt.figure(figsize=(12, 5))
+        plt.plot(self.sentiment_index, label="构建的情绪指数", linewidth=2)
+        if benchmark is not None:
+            plt.plot(benchmark, label="参考情绪指数", linestyle='--')
+        plt.title("市场情绪指数（PCA构建）")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_weights(self):
+        """
+        展示各因子在主成分中的权重
+        """
+        if self.pca_weights is None:
+            self.fit_pca()
+
+        plt.figure(figsize=(10, 4))
+        sns.barplot(x=self.pca_weights.index, y=self.pca_weights.values)
+        plt.title("主成分权重（第1主成分）")
+        plt.ylabel("权重")
+        plt.grid(axis="y")
+        plt.tight_layout()
+        plt.show()
+
+    def rolling_fit(self, window: int = 60, min_periods: int = 30) -> pd.Series:
+        """
+        动态滚动构建市场情绪指数（滚动窗口PCA）
+
+        参数：
+        - window: 滚动窗口大小
+        - min_periods: 最小样本数限制
+        返回：
+        - pd.Series，动态市场情绪指数
+        """
+        sentiment_series = []
+
+        for i in range(window, len(self.raw_data)):
+            window_data = self.raw_data.iloc[i - window:i].dropna()
+            if len(window_data) < min_periods:
+                sentiment_series.append(np.nan)
+                continue
+
+            # 滚动标准化
+            if self.scale:
+                scaled = StandardScaler().fit_transform(window_data)
+            else:
+                scaled = window_data.values
+
+            pca = PCA(n_components=self.n_components)
+            result = pca.fit_transform(scaled)
+            sentiment_series.append(result[-1, 0])  # 只取最后一条主成分数据
+
+        # 对齐索引
+        aligned_index = self.raw_data.index[window:]
+        return pd.Series(sentiment_series, index=aligned_index, name='RollingSentimentIndex')
