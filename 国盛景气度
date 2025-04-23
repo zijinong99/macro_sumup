@@ -1,0 +1,337 @@
+# A股景气度高频指标系统 - 基础框架构建
+# 作者：你
+# 功能：标准化处理 + 时间对齐 + 单指标封装 + 滞后调整 + 指标函数实现 + 指数合成
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from typing import Optional, Union
+
+
+class Standardizer:
+    """
+    标准化工具类
+    支持 Z-score / MinMax / 自定义归一化
+    """
+    def __init__(self, method: str = 'zscore'):
+        self.method = method
+        self.scaler = None
+
+    def fit_transform(self, series: pd.Series) -> pd.Series:
+        series = series.dropna()
+        if self.method == 'zscore':
+            mean, std = series.mean(), series.std()
+            return (series - mean) / std
+        elif self.method == 'minmax':
+            min_val, max_val = series.min(), series.max()
+            return (series - min_val) / (max_val - min_val)
+        else:
+            raise ValueError("Unsupported method")
+
+
+class IndicatorProcessor:
+    """
+    单一指标处理类
+    - 支持频率调整、同比计算、标准化
+    - 支持滞后期设置
+    """
+    def __init__(self,
+                 name: str,
+                 raw_data: pd.Series,
+                 freq: str = 'M',
+                 lag: int = 0,
+                 method: str = 'yoy',
+                 standardizer: Optional[Standardizer] = None):
+        self.name = name
+        self.raw = raw_data.sort_index()
+        self.freq = freq
+        self.lag = lag
+        self.method = method
+        self.standardizer = standardizer or Standardizer()
+        self.processed = None
+
+    def _resample(self):
+        if self.freq == 'M':
+            return self.raw.resample('M').mean()
+        elif self.freq == 'W':
+            return self.raw.resample('W').mean()
+        elif self.freq == 'D':
+            return self.raw
+        else:
+            raise ValueError("Unsupported frequency")
+
+    def _calc_growth(self, series: pd.Series) -> pd.Series:
+        if self.method == 'yoy':
+            return series.pct_change(12) * 100
+        elif self.method == 'mom':
+            return series.pct_change(1) * 100
+        else:
+            raise ValueError("Unsupported growth method")
+
+    def _apply_lag(self, series: pd.Series) -> pd.Series:
+        return series.shift(self.lag)
+
+    def run(self) -> pd.Series:
+        resampled = self._resample()
+        growth = self._calc_growth(resampled)
+        lagged = self._apply_lag(growth)
+        standardized = self.standardizer.fit_transform(lagged)
+        self.processed = standardized.rename(self.name)
+        return self.processed
+
+
+# ========== 指标实现区域 ==========
+
+def get_indicators_dict(raw_data_dict):
+    indicators = {}
+    param_config = {
+        '铁路货运量':     {'freq': 'M', 'lag': 0, 'method': 'yoy'},
+        '公路货运流量':   {'freq': 'W', 'lag': 0, 'method': 'yoy'},
+        '用电量':         {'freq': 'M', 'lag': 0, 'method': 'yoy'},
+        '重点耗煤':       {'freq': 'D', 'lag': 0, 'method': 'yoy'},
+        '粗钢产量':       {'freq': 'M', 'lag': 0, 'method': 'yoy'},
+        'PMI新订单':     {'freq': 'M', 'lag': 0, 'method': 'mom'},
+        '挖掘机销量':     {'freq': 'M', 'lag': 1, 'method': 'yoy'},
+        '重卡销量':       {'freq': 'M', 'lag': 1, 'method': 'yoy'},
+        '水泥产量':       {'freq': 'M', 'lag': 1, 'method': 'yoy'},
+        '乘用车销量':     {'freq': 'M', 'lag': 0, 'method': 'yoy'},
+        '电影票房':       {'freq': 'D', 'lag': 0, 'method': 'yoy'},
+        '快递业务量':     {'freq': 'M', 'lag': 0, 'method': 'yoy'},
+        '地铁客运量':     {'freq': 'D', 'lag': 0, 'method': 'yoy'},
+        '民航客运量':     {'freq': 'M', 'lag': 0, 'method': 'yoy'},
+        '出口同比':       {'freq': 'M', 'lag': 1, 'method': 'yoy'},
+        '港口吞吐量':     {'freq': 'M', 'lag': 1, 'method': 'yoy'},
+        '商品房销售面积': {'freq': 'M', 'lag': 2, 'method': 'yoy'},
+        '百度买房搜索':   {'freq': 'D', 'lag': 1, 'method': 'yoy'},
+    }
+
+    for name, raw_series in raw_data_dict.items():
+        config = param_config.get(name, {})
+        processor = IndicatorProcessor(
+            name=name,
+            raw_data=raw_series,
+            freq=config.get('freq', 'M'),
+            lag=config.get('lag', 0),
+            method=config.get('method', 'yoy'),
+            standardizer=Standardizer('zscore')
+        )
+        indicators[name] = processor.run()
+
+    df = pd.concat(indicators.values(), axis=1)
+    return df.dropna()
+
+
+# ========== 综合指数计算模块 ==========
+
+class MarketClimateIndex:
+    """
+    综合景气度指数计算类
+    支持平均法和PCA两种合成方式
+    """
+    def __init__(self, indicators_df: pd.DataFrame):
+        self.df = indicators_df
+        self.index_series = None
+        self.pca = None
+
+    def compute_average_index(self, weights: Optional[dict] = None) -> pd.Series:
+        if weights:
+            aligned_weights = pd.Series(weights).reindex(self.df.columns).fillna(0)
+            self.index_series = self.df.dot(aligned_weights)
+        else:
+            self.index_series = self.df.mean(axis=1)
+        return self.index_series
+
+    def compute_pca_index(self, n_components: int = 1) -> pd.Series:
+        pca = PCA(n_components=n_components)
+        pca_result = pca.fit_transform(self.df)
+        self.pca = pca
+        self.index_series = pd.Series(pca_result[:, 0], index=self.df.index, name="PCA_Index")
+        return self.index_series
+
+    def get_pca_weights(self) -> Optional[pd.Series]:
+        if self.pca is not None:
+            return pd.Series(self.pca.components_[0], index=self.df.columns, name="PCA_Weights")
+        return None
+
+
+# -*- coding: utf-8 -*-
+"""
+项目：A股景气度高频指数复刻
+目标：复现《国盛证券：A股景气度高频指数构建与观察》中的指数构建流程
+"""
+
+import pandas as pd
+import numpy as np
+import datetime
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression
+from typing import List, Dict, Tuple
+from tqdm import tqdm
+
+# WindPy 接口初始化
+from WindPy import w
+w.start()
+
+# ------------------------
+# 一、定义全局变量和指标字典
+# ------------------------
+
+# 指标配置
+INDICATOR_CONFIG = [
+    # 宏观：经济增长
+    {"name": "GDP_工业_当季同比", "wind_code": "GDP.YOY", "freq": "Q"},
+
+    # 宏观：通胀
+    {"name": "CRB_现货_工业原料", "wind_code": "S0039749", "freq": "D"},
+
+    # 宏观：投资
+    {"name": "房地产开发投资完成额_累计同比", "wind_code": "S6007482", "freq": "M"},
+
+    # 宏观：出口
+    {"name": "PMI_新出口订单", "wind_code": "M0207035", "freq": "M"},
+
+    # 宏观：利率
+    {"name": "SHIBOR_3M", "wind_code": "SHIBOR3M.IR", "freq": "D"},
+
+    # 中观：工业产量 - 家电
+    {"name": "家用电冰箱_产量同比", "wind_code": "S6003280", "freq": "M"},
+    {"name": "家用洗衣机_产量同比", "wind_code": "S6003277", "freq": "M"},
+    {"name": "空调_产量同比", "wind_code": "S6003282", "freq": "M"},
+
+    # 中观：工业产量 - 机械
+    {"name": "交流电动机_产量同比", "wind_code": "S6003312", "freq": "M"},
+    {"name": "金属集装箱_产量同比", "wind_code": "S6003300", "freq": "M"},
+    {"name": "水泥设备_产量同比", "wind_code": "S6003303", "freq": "M"},
+
+    # 中观：工业产量 - 钢铁
+    {"name": "钢材_产量_累计值", "wind_code": "S6000156", "freq": "Q"},
+    {"name": "黑色金属冶炼_企业景气指数", "wind_code": "S6002087", "freq": "Q"},
+
+    # 中观：工业利润
+    {"name": "亏损企业_亏损额_累计同比", "wind_code": "S6007478", "freq": "M"},
+    {"name": "利润总额_累计同比", "wind_code": "S6007476", "freq": "M"},
+    {"name": "工业增加值_国企同比", "wind_code": "S6007394", "freq": "M"},
+
+    # 中观：经济活跃度
+    {"name": "BDI", "wind_code": "BDI.BDI", "freq": "D"},
+    {"name": "民航货邮周转量_同比", "wind_code": "S0039737", "freq": "M"},
+]
+
+# Nowcasting目标：上证指数归母净利润同比
+TARGET_CODE = "S5107397"
+
+# 时间范围
+START_DATE = "2000-06-01"
+END_DATE = "2020-06-30"
+
+
+# ------------------------
+# 二、数据抓取与预处理模块
+# ------------------------
+
+def fetch_wind_data(code: str, start: str, end: str, freq: str) -> pd.DataFrame:
+    """调用WindAPI获取数据"""
+    freq_map = {"D": "day", "M": "month", "Q": "quarter"}
+    result = w.edb(code, start, end, f"Fill=Previous;Period={freq_map[freq]}")
+    if result.ErrorCode != 0:
+        print(f"[ERROR] 获取 {code} 数据失败：{result.ErrorCode}")
+        return pd.DataFrame()
+    df = pd.DataFrame({"time": result.Times, code: result.Data[0]})
+    df["time"] = pd.to_datetime(df["time"])
+    return df.set_index("time")
+
+
+def unify_freq(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """统一频率为季度"""
+    if freq == "D":
+        return df.resample("Q").mean()
+    elif freq == "M":
+        return df.resample("Q").mean()
+    elif freq == "Q":
+        return df
+    else:
+        raise ValueError("不支持的频率类型")
+
+
+def collect_all_indicators() -> pd.DataFrame:
+    """下载所有指标并合并为单一DataFrame"""
+    dfs = []
+    for item in tqdm(INDICATOR_CONFIG, desc="获取并降频指标数据"):
+        df = fetch_wind_data(item["wind_code"], START_DATE, END_DATE, item["freq"])
+        df = unify_freq(df, item["freq"])
+        df.rename(columns={item["wind_code"]: item["name"]}, inplace=True)
+        dfs.append(df)
+    result = pd.concat(dfs, axis=1)
+    return result
+
+
+def fetch_target() -> pd.Series:
+    """获取上证指数归母净利润同比作为目标变量"""
+    df = fetch_wind_data(TARGET_CODE, START_DATE, END_DATE, "Q")
+    return df.squeeze()
+
+
+# ------------------------
+# 三、PCA与回归配权
+# ------------------------
+
+def apply_pca(data: pd.DataFrame, n_components=5) -> pd.DataFrame:
+    pca = PCA(n_components=n_components)
+    principal_components = pca.fit_transform(data.fillna(method='ffill'))
+    pc_df = pd.DataFrame(principal_components, index=data.index, columns=[f"PC{i+1}" for i in range(n_components)])
+    return pc_df
+
+
+def compute_weights(pca_df: pd.DataFrame, target: pd.Series) -> np.ndarray:
+    common_idx = pca_df.index.intersection(target.index)
+    X = pca_df.loc[common_idx].values
+    y = target.loc[common_idx].values
+    reg = LinearRegression()
+    reg.fit(X, y)
+    return reg.coef_
+
+
+def construct_index(pca_df: pd.DataFrame, weights: np.ndarray) -> pd.Series:
+    return pd.Series(np.dot(pca_df.values, weights), index=pca_df.index)
+
+
+# ------------------------
+# 四、升频与信息流跟踪
+# ------------------------
+
+def upscale_index(index: pd.Series, freq="D") -> pd.Series:
+    """升频为日度指数"""
+    index = index.resample(freq).ffill()
+    return index
+
+
+# ------------------------
+# 五、主函数运行逻辑
+# ------------------------
+
+def main():
+    print("步骤1：抓取并合并所有成分指标...")
+    indicator_data = collect_all_indicators()
+
+    print("步骤2：获取目标变量（归母净利润同比）...")
+    target_series = fetch_target()
+
+    print("步骤3：执行PCA并构建因子...")
+    pca_result = apply_pca(indicator_data)
+
+    print("步骤4：使用回归确定权重...")
+    weights = compute_weights(pca_result, target_series)
+
+    print("步骤5：合成季度景气度指数...")
+    index_quarterly = construct_index(pca_result, weights)
+
+    print("步骤6：升频为日频指数...")
+    index_daily = upscale_index(index_quarterly)
+
+    print(index_daily.tail())
+
+
+if __name__ == '__main__':
+    main()
+
